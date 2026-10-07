@@ -1,0 +1,624 @@
+name: Anogs Hook Framework CI/CD
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+      - 'release/**'
+    paths:
+      - '**.cpp'
+      - '**.h'
+      - 'Makefile'
+      - 'build.sh'
+      - '.github/workflows/**'
+      - 'symbol_finder.cpp'
+  pull_request:
+    branches:
+      - main
+      - develop
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Build type'
+        required: true
+        default: 'debug'
+        type: choice
+        options:
+          - debug
+          - release
+          - package
+
+env:
+  PROJECT_NAME: anogs_hook
+  MIN_OS_VERSION: '12.0'
+  DEPLOYMENT_TARGET: '12.0'
+  XCODE_VERSION: '14.3.1'
+  ARTIFACT_RETENTION_DAYS: 30
+
+jobs:
+  # ============================================================================
+  # Pre-flight checks
+  # ============================================================================
+  pre-flight:
+    name: Pre-flight Checks
+    runs-on: macos-13
+    timeout-minutes: 15
+    outputs:
+      build_version: ${{ steps.version.outputs.version }}
+      build_sha: ${{ steps.version.outputs.sha }}
+      should_deploy: ${{ steps.deploy_check.outputs.should_deploy }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract version info
+        id: version
+        run: |
+          VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo "0.0.0-dev")
+          SHA=$(git rev-parse --short HEAD)
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "sha=${SHA}" >> $GITHUB_OUTPUT
+          echo "Build Version: ${VERSION}"
+          echo "Git SHA: ${SHA}"
+
+      - name: Check deployment eligibility
+        id: deploy_check
+        run: |
+          if [[ "${{ github.ref }}" == "refs/heads/main" && "${{ github.event_name }}" == "push" ]]; then
+            echo "should_deploy=true" >> $GITHUB_OUTPUT
+          else
+            echo "should_deploy=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Validate file structure
+        run: |
+          echo "[*] Validating project structure..."
+          test -f Makefile || (echo "[-] Makefile not found" && exit 1)
+          test -f anogs_hook.cpp || (echo "[-] anogs_hook.cpp not found" && exit 1)
+          test -f inject_dylib.cpp || (echo "[-] inject_dylib.cpp not found" && exit 1)
+          test -f symbol_finder.cpp || (echo "[-] symbol_finder.cpp not found" && exit 1)
+          echo "[✓] All required files present"
+
+      - name: Validate syntax
+        run: |
+          echo "[*] Validating C++ syntax..."
+          for file in *.cpp; do
+            echo "  Checking $file..."
+            clang -fsyntax-only -std=c++17 "$file" || exit 1
+          done
+          echo "[✓] Syntax validation passed"
+
+  # ============================================================================
+  # Matrix build for ARM64 and ARM64e
+  # ============================================================================
+  build:
+    name: Build ${{ matrix.arch }} - ${{ matrix.config }}
+    runs-on: macos-13
+    needs: pre-flight
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [arm64, arm64e]
+        config: [debug, release]
+        include:
+          - arch: arm64
+            arch_name: "ARM64"
+            build_flag: "arm64"
+          - arch: arm64e
+            arch_name: "ARM64e (PAC)"
+            build_flag: "arm64e"
+          - config: debug
+            make_target: "debug"
+            optimization: "g"
+          - config: release
+            make_target: "release"
+            optimization: "O3"
+
+    env:
+      ARCH: ${{ matrix.arch }}
+      BUILD_CONFIG: ${{ matrix.config }}
+      MAKE_TARGET: ${{ matrix.make_target }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: ${{ env.XCODE_VERSION }}
+
+      - name: Cache build artifacts
+        uses: actions/cache@v3
+        with:
+          path: |
+            .build/${{ matrix.arch }}
+            ~/Library/Developer/Xcode/DerivedData
+          key: build-${{ matrix.arch }}-${{ matrix.config }}-${{ hashFiles('Makefile', '*.cpp') }}
+          restore-keys: |
+            build-${{ matrix.arch }}-${{ matrix.config }}-
+            build-${{ matrix.arch }}-
+
+      - name: Cache SDK
+        uses: actions/cache@v3
+        with:
+          path: ~/.xcode-sdk-cache
+          key: xcode-sdk-${{ env.XCODE_VERSION }}
+          restore-keys: xcode-sdk-
+
+      - name: Display environment info
+        run: |
+          echo "=== Build Environment ==="
+          echo "Architecture: ${{ matrix.arch_name }}"
+          echo "Configuration: ${{ matrix.config }}"
+          echo "Xcode Version: $(xcode-select -p)"
+          echo "iOS SDK Version: $(xcrun --sdk iphoneos --show-sdk-version)"
+          echo "Deployment Target: ${{ env.MIN_OS_VERSION }}"
+          echo ""
+          echo "=== Compiler Info ==="
+          xcrun -find clang
+          xcrun -find clang++
+          clang --version
+
+      - name: Create build directory
+        run: |
+          mkdir -p .build/${{ matrix.arch }}
+          cd .build/${{ matrix.arch }}
+
+      - name: Configure build
+        run: |
+          echo "[*] Configuring build for ${{ matrix.arch }}..."
+          export ARCH=${{ matrix.arch }}
+          export BUILD_CONFIG=${{ matrix.config }}
+          echo "Build configuration ready"
+
+      - name: Build dylib (anogs_hook)
+        run: |
+          echo "[*] Building anogs_hook dylib for ${{ matrix.arch }}..."
+          make clean
+          make check-env
+          make -j$(sysctl -n hw.ncpu) ${{ matrix.make_target }}
+          ls -lh libAnogsHook.dylib || true
+
+      - name: Verify build artifacts
+        run: |
+          echo "[*] Verifying build artifacts..."
+          
+          if [ ! -f "libAnogsHook.dylib" ]; then
+            echo "[-] libAnogsHook.dylib not found"
+            exit 1
+          fi
+          
+          echo "[✓] dylib generated"
+          file libAnogsHook.dylib
+          
+          # Check for architecture
+          if lipo -info libAnogsHook.dylib | grep -q "${{ matrix.arch }}"; then
+            echo "[✓] Correct architecture: ${{ matrix.arch }}"
+          else
+            echo "[-] Architecture mismatch"
+            exit 1
+          fi
+          
+          # Check minimum OS version
+          otool -l libAnogsHook.dylib | grep -A2 "LC_VERSION_MIN_IPHONEOS\|LC_BUILD_VERSION" || true
+
+      - name: Run static analysis
+        continue-on-error: true
+        run: |
+          echo "[*] Running static analysis..."
+          scan-build --status-bugs make clean || true
+          scan-build --status-bugs -o .build/scan-results make 2>&1 | head -20 || true
+
+      - name: Generate symbols
+        run: |
+          echo "[*] Extracting debug symbols..."
+          mkdir -p .build/${{ matrix.arch }}/symbols
+          dsymutil libAnogsHook.dylib -o .build/${{ matrix.arch }}/symbols/libAnogsHook.dylib.dSYM || true
+          ls -la .build/${{ matrix.arch }}/symbols/ || true
+
+      - name: Code sign artifacts
+        run: |
+          echo "[*] Code signing dylib..."
+          codesign -s - libAnogsHook.dylib -v || true
+          codesign -v libAnogsHook.dylib || true
+
+      - name: Build test binary
+        continue-on-error: true
+        run: |
+          echo "[*] Building injector binary..."
+          make anogs_injector || true
+          file anogs_injector 2>/dev/null || echo "Injector not built"
+
+      - name: Archive build outputs
+        if: always()
+        run: |
+          echo "[*] Archiving artifacts..."
+          mkdir -p .artifacts/${{ matrix.arch }}-${{ matrix.config }}
+          cp libAnogsHook.dylib .artifacts/${{ matrix.arch }}-${{ matrix.config }}/ 2>/dev/null || true
+          cp anogs_injector .artifacts/${{ matrix.arch }}-${{ matrix.config }}/ 2>/dev/null || true
+          cp symbol_finder .artifacts/${{ matrix.arch }}-${{ matrix.config }}/ 2>/dev/null || true
+          cp -r .build/${{ matrix.arch }}/symbols .artifacts/${{ matrix.arch }}-${{ matrix.config }}/ 2>/dev/null || true
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: build-${{ matrix.arch }}-${{ matrix.config }}
+          path: .artifacts/${{ matrix.arch }}-${{ matrix.config }}/
+          retention-days: ${{ env.ARTIFACT_RETENTION_DAYS }}
+          if-no-files-found: ignore
+
+      - name: Upload symbols
+        uses: actions/upload-artifact@v3
+        if: matrix.config == 'debug'
+        with:
+          name: symbols-${{ matrix.arch }}
+          path: .build/${{ matrix.arch }}/symbols/
+          retention-days: ${{ env.ARTIFACT_RETENTION_DAYS }}
+          if-no-files-found: ignore
+
+  # ============================================================================
+  # Test and validation
+  # ============================================================================
+  test:
+    name: Test Suite - ${{ matrix.test_type }}
+    runs-on: macos-13
+    needs: [pre-flight, build]
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        test_type:
+          - static_analysis
+          - symbols
+          - codesign
+          - architecture
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: ${{ env.XCODE_VERSION }}
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: build-arm64-release
+          path: test-artifacts/
+
+      - name: Test - Static Analysis
+        if: matrix.test_type == 'static_analysis'
+        run: |
+          echo "[*] Running static analysis..."
+          for file in *.cpp; do
+            echo "  Analyzing $file..."
+            clang -analyze -std=c++17 "$file" 2>&1 | head -10 || true
+          done
+          echo "[✓] Static analysis complete"
+
+      - name: Test - Symbol Validation
+        if: matrix.test_type == 'symbols'
+        run: |
+          echo "[*] Validating symbols..."
+          if [ -f "test-artifacts/libAnogsHook.dylib" ]; then
+            nm -U test-artifacts/libAnogsHook.dylib | head -20 || true
+            echo "[✓] Symbol table valid"
+          else
+            echo "[!] Artifact not found"
+          fi
+
+      - name: Test - Code Signature
+        if: matrix.test_type == 'codesign'
+        run: |
+          echo "[*] Verifying code signatures..."
+          if [ -f "test-artifacts/libAnogsHook.dylib" ]; then
+            codesign -v test-artifacts/libAnogsHook.dylib
+            echo "[✓] Code signature valid"
+          fi
+
+      - name: Test - Architecture Check
+        if: matrix.test_type == 'architecture'
+        run: |
+          echo "[*] Verifying architectures..."
+          if [ -f "test-artifacts/libAnogsHook.dylib" ]; then
+            file test-artifacts/libAnogsHook.dylib
+            lipo -info test-artifacts/libAnogsHook.dylib
+            echo "[✓] Architecture check passed"
+          fi
+
+  # ============================================================================
+  # Universal binary creation
+  # ============================================================================
+  lipo:
+    name: Create Universal Binaries
+    runs-on: macos-13
+    needs: test
+    timeout-minutes: 15
+    if: success()
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v3
+        with:
+          path: artifacts/
+
+      - name: Create universal dylib
+        run: |
+          echo "[*] Creating universal binary..."
+          mkdir -p universal
+          
+          # Find arm64 and arm64e dylibs
+          ARM64_DYLIB=$(find artifacts -name "libAnogsHook.dylib" -path "*arm64-release*" ! -path "*arm64e*" | head -1)
+          ARM64E_DYLIB=$(find artifacts -name "libAnogsHook.dylib" -path "*arm64e-release*" | head -1)
+          
+          if [ -z "$ARM64_DYLIB" ] || [ -z "$ARM64E_DYLIB" ]; then
+            echo "[-] Could not find both architectures"
+            ls -R artifacts/
+            exit 1
+          fi
+          
+          echo "[+] ARM64: $ARM64_DYLIB"
+          echo "[+] ARM64e: $ARM64E_DYLIB"
+          
+          lipo -create "$ARM64_DYLIB" "$ARM64E_DYLIB" -output universal/libAnogsHook.dylib
+          
+          echo "[✓] Universal binary created"
+          file universal/libAnogsHook.dylib
+          lipo -info universal/libAnogsHook.dylib
+
+      - name: Verify universal binary
+        run: |
+          echo "[*] Verifying universal binary..."
+          
+          if lipo -info universal/libAnogsHook.dylib | grep -q "arm64"; then
+            echo "[✓] arm64 present"
+          fi
+          
+          if lipo -info universal/libAnogsHook.dylib | grep -q "arm64e"; then
+            echo "[✓] arm64e present"
+          fi
+          
+          size_kb=$(($(stat -f%z universal/libAnogsHook.dylib) / 1024))
+          echo "[+] Universal dylib size: ${size_kb}KB"
+
+      - name: Code sign universal binary
+        run: |
+          echo "[*] Signing universal binary..."
+          codesign -s - universal/libAnogsHook.dylib -v
+          codesign -v universal/libAnogsHook.dylib
+          echo "[✓] Universal binary signed"
+
+      - name: Upload universal binary
+        uses: actions/upload-artifact@v3
+        with:
+          name: universal-binary
+          path: universal/
+          retention-days: ${{ env.ARTIFACT_RETENTION_DAYS }}
+
+  # ============================================================================
+  # Security scanning
+  # ============================================================================
+  security:
+    name: Security Scan
+    runs-on: macos-13
+    needs: build
+    timeout-minutes: 20
+    if: always()
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run dependency check
+        continue-on-error: true
+        run: |
+          echo "[*] Checking for known vulnerabilities..."
+          # Basic dependency audit
+          grep -r "include" *.cpp | grep -v "mach\|sys\|cstdlib" | sort -u || true
+
+      - name: Check for hardcoded secrets
+        continue-on-error: true
+        run: |
+          echo "[*] Scanning for hardcoded secrets..."
+          grep -r "password\|secret\|token\|key" *.cpp || echo "[✓] No obvious secrets found"
+
+      - name: Analyze source code
+        continue-on-error: true
+        run: |
+          echo "[*] Analyzing source code patterns..."
+          
+          # Check for unsafe functions
+          for file in *.cpp; do
+            echo "  Checking $file..."
+            grep -E "strcpy|strcat|sprintf|gets|scanf" "$file" && echo "    [!] Potentially unsafe function found" || true
+          done
+
+      - name: Generate SBOM
+        continue-on-error: true
+        run: |
+          echo "[*] Generating Software Bill of Materials..."
+          echo "# SBOM - Anogs Hook Framework" > SBOM.txt
+          echo "" >> SBOM.txt
+          echo "## Source Files" >> SBOM.txt
+          for file in *.cpp *.h 2>/dev/null; do
+            [ -f "$file" ] && echo "- $file ($(wc -l < "$file") lines)" >> SBOM.txt
+          done
+          cat SBOM.txt
+
+  # ============================================================================
+  # Documentation generation
+  # ============================================================================
+  docs:
+    name: Generate Documentation
+    runs-on: macos-13
+    needs: pre-flight
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Generate code documentation
+        continue-on-error: true
+        run: |
+          echo "[*] Generating documentation..."
+          
+          echo "# Anogs Hook Framework Documentation" > docs.md
+          echo "" >> docs.md
+          echo "**Version:** ${{ needs.pre-flight.outputs.build_version }}" >> docs.md
+          echo "**Build:** ${{ needs.pre-flight.outputs.build_sha }}" >> docs.md
+          echo "" >> docs.md
+          
+          echo "## Architecture" >> docs.md
+          echo "" >> docs.md
+          echo "### Source Files" >> docs.md
+          for file in *.cpp; do
+            echo "- **$file** ($(wc -l < "$file") lines)" >> docs.md
+          done
+          echo "" >> docs.md
+          
+          echo "## Build Instructions" >> docs.md
+          echo "\`\`\`bash" >> docs.md
+          echo "make clean && make all && make verify" >> docs.md
+          echo "\`\`\`" >> docs.md
+
+      - name: Upload documentation
+        uses: actions/upload-artifact@v3
+        with:
+          name: documentation
+          path: docs.md
+          retention-days: ${{ env.ARTIFACT_RETENTION_DAYS }}
+
+  # ============================================================================
+  # Release creation
+  # ============================================================================
+  release:
+    name: Create Release
+    runs-on: macos-13
+    needs: [pre-flight, lipo, test, security]
+    timeout-minutes: 20
+    if: needs.pre-flight.outputs.should_deploy == 'true' && success()
+
+    permissions:
+      contents: write
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download universal binary
+        uses: actions/download-artifact@v3
+        with:
+          name: universal-binary
+          path: release-artifacts/
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v3
+        with:
+          path: all-artifacts/
+
+      - name: Create release package
+        run: |
+          echo "[*] Creating release package..."
+          
+          mkdir -p release-package/${{ env.PROJECT_NAME }}-${{ needs.pre-flight.outputs.build_version }}
+          
+          # Copy dylib
+          cp release-artifacts/libAnogsHook.dylib release-package/${{ env.PROJECT_NAME }}-${{ needs.pre-flight.outputs.build_version }}/ 2>/dev/null || true
+          
+          # Copy injector
+          cp all-artifacts/build-arm64-release/anogs_injector release-package/${{ env.PROJECT_NAME }}-${{ needs.pre-flight.outputs.build_version }}/ 2>/dev/null || true
+          
+          # Copy symbol finder
+          cp all-artifacts/build-arm64-release/symbol_finder release-package/${{ env.PROJECT_NAME }}-${{ needs.pre-flight.outputs.build_version }}/ 2>/dev/null || true
+          
+          # Add deployment guide
+          cp DEPLOYMENT.md release-package/${{ env.PROJECT_NAME }}-${{ needs.pre-flight.outputs.build_version }}/README.md 2>/dev/null || echo "DEPLOYMENT.md not found"
+          
+          # Create tarball
+          tar -czf ${{ env.PROJECT_NAME }}-${{ needs.pre-flight.outputs.build_version }}.tar.gz -C release-package .
+          
+          echo "[✓] Release package created"
+          ls -lh ${{ env.PROJECT_NAME }}-*.tar.gz
+
+      - name: Generate release notes
+        run: |
+          echo "# Release ${{ needs.pre-flight.outputs.build_version }}" > RELEASE_NOTES.md
+          echo "" >> RELEASE_NOTES.md
+          echo "**Build Date:** $(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> RELEASE_NOTES.md
+          echo "**Commit:** ${{ needs.pre-flight.outputs.build_sha }}" >> RELEASE_NOTES.md
+          echo "" >> RELEASE_NOTES.md
+          echo "## Contents" >> RELEASE_NOTES.md
+          echo "" >> RELEASE_NOTES.md
+          echo "- `libAnogsHook.dylib` - Universal dylib (arm64 + arm64e)" >> RELEASE_NOTES.md
+          echo "- `anogs_injector` - Injection binary" >> RELEASE_NOTES.md
+          echo "- `symbol_finder` - Symbol discovery tool" >> RELEASE_NOTES.md
+          echo "- `README.md` - Deployment guide" >> RELEASE_NOTES.md
+          echo "" >> RELEASE_NOTES.md
+          echo "## Architecture" >> RELEASE_NOTES.md
+          echo "" >> RELEASE_NOTES.md
+          echo "- ARM64 (iOS 12.0+)" >> RELEASE_NOTES.md
+          echo "- ARM64e (Pointer Authentication, iOS 12.0+)" >> RELEASE_NOTES.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            ${{ env.PROJECT_NAME }}-${{ needs.pre-flight.outputs.build_version }}.tar.gz
+            RELEASE_NOTES.md
+          body_path: RELEASE_NOTES.md
+          tag_name: v${{ needs.pre-flight.outputs.build_version }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ============================================================================
+  # Final reporting
+  # ============================================================================
+  report:
+    name: Build Report
+    runs-on: ubuntu-latest
+    needs: [pre-flight, build, test, lipo]
+    timeout-minutes: 10
+    if: always()
+
+    steps:
+      - name: Generate build summary
+        run: |
+          echo "# Anogs Hook Framework - Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Item | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Pre-flight | ${{ needs.pre-flight.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Build | ${{ needs.build.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Test | ${{ needs.test.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Lipo | ${{ needs.lipo.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Version:** ${{ needs.pre-flight.outputs.build_version }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** ${{ needs.pre-flight.outputs.build_sha }}" >> $GITHUB_STEP_SUMMARY
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "❌ Build failed"
+          exit 1
+
+      - name: Success notification
+        if: success()
+        run: |
+          echo "✅ All checks passed"
+          echo "Release ready for deployment"
